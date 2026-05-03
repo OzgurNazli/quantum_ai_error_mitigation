@@ -257,7 +257,7 @@ def build_hamiltonian(
     return spin_op, n_qubits, hf_state
 
 
-def _pennylane_ham_to_cudaq(H_pl, n_qubits) -> cudaq.SpinOperator:
+def _pennylane_ham_to_cudaq(H_pl: qml.Hamiltonian, n_qubits: int) -> cudaq.SpinOperator:
     """
     Converts a PennyLane Hamiltonian to a CUDA-Q SpinOperator.
 
@@ -273,9 +273,7 @@ def _pennylane_ham_to_cudaq(H_pl, n_qubits) -> cudaq.SpinOperator:
         cudaq.SpinOperator representing the same Hamiltonian.
     """
     total_op: cudaq.SpinOperator | None = None
-    
     coeffs, ops = H_pl.terms()
-
     for coeff, op in zip(coeffs, ops):
         pauli_word = _extract_pauli_word(op, n_qubits)   # e.g. "IXZYI"
         term_op    = _pauli_word_to_spin_op(pauli_word)
@@ -740,6 +738,37 @@ def train_gqe(
 # These are the inputs and outputs of the DiffusionCompiler at inference time.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _two_qubit_depol_kraus(p: float) -> list:
+    """
+    Constructs the 16 Kraus operators for the two-qubit depolarising channel.
+
+    The channel acts as:
+        ρ → (1-p)ρ + (p/15) Σ_{i,j≠(0,0)} (σ_i⊗σ_j) ρ (σ_i⊗σ_j)†
+
+    All operators are 4×4 complex matrices, as required by cudaq.KrausChannel
+    when applied to a 2-qubit gate (e.g. "cx").
+
+    Args:
+        p: Total depolarisation probability ∈ [0, 1].
+
+    Returns:
+        List of 16 numpy arrays, each of shape (4, 4) and dtype complex128.
+    """
+    import itertools
+
+    _I = np.eye(2, dtype=complex)
+    _X = np.array([[0, 1], [1, 0]], dtype=complex)
+    _Y = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    _Z = np.array([[1, 0], [0, -1]], dtype=complex)
+    paulis = [_I, _X, _Y, _Z]
+
+    kraus = []
+    for i, j in itertools.product(range(4), repeat=2):
+        coeff = np.sqrt(1.0 - p) if (i == 0 and j == 0) else np.sqrt(p / 15.0)
+        kraus.append((coeff * np.kron(paulis[i], paulis[j])).astype(complex))
+    return kraus
+
+
 def generate_qem_dataset(
     gptqe: GPTQE,
     n_qubits: int,
@@ -793,17 +822,19 @@ def generate_qem_dataset(
     zz_ops = [cudaq_spin.z(i) * cudaq_spin.z(i + 1) for i in range(n_qubits - 1)]
 
     # ── Noise model: depolarising channel on entanglement gates ───────────────
-    # Two-qubit CX gates receive full depol_p; single-qubit gates receive 10×
+    # "cx" is a 2-qubit gate → needs 4×4 Kraus operators (16 terms).
+    # cudaq.DepolarizationChannel produces 2×2 Kraus operators only, which
+    # would raise a dimension-mismatch RuntimeError when applied to "cx".
+    # We therefore build the two-qubit depolarising channel explicitly and
+    # wrap it in cudaq.KrausChannel.  Single-qubit gates can still use the
+    # convenience cudaq.DepolarizationChannel (2×2 operators).
     noise_model = cudaq.NoiseModel()
     noise_model.add_all_qubit_channel(
-        "cx", cudaq.DepolarizationChannel(depol_p)
+        "cx", cudaq.KrausChannel(_two_qubit_depol_kraus(depol_p))
     )
-    noise_model.add_all_qubit_channel(
-        "ry", cudaq.DepolarizationChannel(depol_p / 10.0)
-    )
-    noise_model.add_all_qubit_channel(
-        "rz", cudaq.DepolarizationChannel(depol_p / 10.0)
-    )
+    _sq_channel = cudaq.DepolarizationChannel(depol_p / 10.0)
+    noise_model.add_all_qubit_channel("ry", _sq_channel)
+    noise_model.add_all_qubit_channel("rz", _sq_channel)
 
     # ── Pre-allocate output arrays ────────────────────────────────────────────
     circuit_tokens_out     = token_array.copy()
